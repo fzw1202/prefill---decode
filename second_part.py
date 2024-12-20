@@ -36,6 +36,7 @@ model_decode.eval()
 
 prefill_queue = asyncio.Queue()
 request_queue = []
+kvcache = None
 max_batch_size = 4
 cnt = 0
 
@@ -53,10 +54,6 @@ async def generate(request: InferenceRequest):
     request.prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-
-    global cnt
-    print(f"request {cnt}: min: {request.min_length}, max: {request.max_length}")
-    cnt += 1
 
     response_future = asyncio.Future()
     request_item = {"request": request, "response": response_future}
@@ -96,6 +93,11 @@ async def prefill_worker():
             for key, value in past_key_values
         )
 
+        global cnt
+        print(
+            f"request {cnt}: min: {request_item["request"].min_length}, max: {request_item["request"].max_length}"
+        )
+
         decode_request_item = {
             "request": inputs.to(device_decode),
             "response": request_item["response"],
@@ -103,87 +105,199 @@ async def prefill_worker():
             "done_flag": False,
             "max": request_item["request"].max_length,
             "min": request_item["request"].min_length,
-            "new_flag": True,
+            "id": cnt,
+            "padding": 0,
         }
         request_queue.append(decode_request_item)
+        cnt += 1
 
 
-# 如果想要实现可以动态插入删除当前request的队列，就不能按batch来处理，而是要每一步decode分开做
-# 可以在这个函数里实现单步的decode
-async def generate_one_step():
-    global request_queue, model_decode
+check_time = 0
+generate_time = 0
 
-    with torch.no_grad():
-        for index, item in enumerate(request_queue):
-            next_input_ids = item["request"]["input_ids"][:, -1:]
-            next_attention_mask = item["request"]["attention_mask"][:, -1:]
-            outputs = model_decode.forward(
-                input_ids=next_input_ids,
-                attention_mask=next_attention_mask,
-                past_key_values=item["kv_cache"],
-                use_cache=True,
+
+async def check_and_update_batch() -> int:
+    global kvcache, request_queue, model_decode, check_time, generate_time
+
+    done_requests = [item for item in request_queue if item["done_flag"]]
+    for item in done_requests:
+        print(
+            f"finish: {item['id']} check_time: {check_time} generate_time: {generate_time}"
+        )
+        decoded_output = tokenizer.decode(
+            item["request"]["input_ids"][0], skip_special_tokens=True
+        )
+        item["response"].set_result({"generated_text": decoded_output})
+
+    remaining_requests = [item for item in request_queue if not item["done_flag"]]
+    request_queue = sorted(
+        remaining_requests,
+        key=lambda x: (
+            x.get("min", float("inf"))
+            - (x["request"]["input_ids"].shape[1] - x.get("padding", 0))
+        ),
+    )
+
+    batch = request_queue[:max_batch_size]
+    # print("Batch IDs:", " ".join(str(item["id"]) for item in batch))
+
+    if len(batch) == 0:
+        return 0
+
+    length = max([item["request"]["input_ids"].shape[1] for item in batch])
+    for item in batch:
+        padding_length = length - item["request"]["input_ids"].shape[1]
+
+        if padding_length > 0:
+            item["padding"] += padding_length
+            padding_input = torch.full(
+                (1, padding_length),
+                tokenizer.pad_token_id,
+                dtype=item["request"]["input_ids"].dtype,
+                device=device_decode,
             )
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+            padding_mask = torch.zeros(
+                (item["request"]["attention_mask"].shape[0], padding_length),
+                dtype=item["request"]["input_ids"].dtype,
+                device=device_decode,
+            )
+
             item["request"]["input_ids"] = torch.cat(
-                [item["request"]["input_ids"], next_token], dim=-1
+                (padding_input, item["request"]["input_ids"]), dim=1
             )
             item["request"]["attention_mask"] = torch.cat(
-                [
-                    item["request"]["attention_mask"],
-                    torch.ones(
-                        (next_token.size(0), 1),
-                        dtype=torch.long,
-                        device=item["request"]["input_ids"].device,
-                    ),
-                ],
-                dim=-1,
+                (padding_mask, item["request"]["attention_mask"]), dim=1
             )
 
-            if item["request"]["input_ids"][0].shape[0] >= item["max"]:
-                item["done_flag"] = True
-            elif (
-                item["request"]["input_ids"][0].shape[0] >= item["min"]
-                and item["request"]["input_ids"][0][-1].item() == tokenizer.eos_token_id
-            ):
-                item["done_flag"] = True
+            kv = item["kv_cache"]
+            padded_kv = []
+            for layer in kv:
+                padded_layer_cache = []
+                for tensor in layer:
+                    cache_padding = torch.zeros(
+                        (
+                            tensor.shape[0],
+                            tensor.shape[1],
+                            padding_length,
+                            tensor.shape[3],
+                        ),
+                        dtype=tensor.dtype,
+                        device=device_decode,
+                    )
+                    padded_tensor = torch.cat(
+                        (cache_padding, tensor), dim=2
+                    ).contiguous()
+                    padded_layer_cache.append(padded_tensor)
 
-            item["kv_cache"] = outputs.past_key_values
+                padded_kv.append(tuple(padded_layer_cache))
+            item["kv_cache"] = tuple(padded_kv)
+
+    kvcache = []
+    for layer_idx in range(32):
+        layer_keys = []
+        layer_values = []
+
+        for item in batch:
+            key, value = item["kv_cache"][layer_idx]
+            layer_keys.append(key.squeeze(0))
+            layer_values.append(value.squeeze(0))
+
+        layer_key = torch.stack(layer_keys, dim=0)
+        layer_value = torch.stack(layer_values, dim=0)
+        kvcache.append((layer_key, layer_value))
+
+    kvcache = tuple(kvcache)
+    return len(batch)
 
 
-decode_cnt = 0
+async def generate_one_step(bsz):
+    global kvcache, request_queue, model_decode, check_time, generate_time
 
+    with torch.no_grad():
+        current_batch = request_queue[:bsz]
+        input_ids = torch.stack(
+            [item["request"]["input_ids"].squeeze(0) for item in current_batch], dim=0
+        )
+        attention_masks = torch.stack(
+            [item["request"]["attention_mask"].squeeze(0) for item in current_batch],
+            dim=0,
+        )
+        inputs = {"input_ids": input_ids, "attention_mask": attention_masks}
+        next_input_id = inputs["input_ids"][:, -1:].contiguous()
+        outputs = model_decode.forward(
+            input_ids=next_input_id,
+            attention_mask=attention_masks,
+            past_key_values=kvcache,
+            use_cache=True,
+        )
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
+        inputs["input_ids"] = torch.cat([inputs["input_ids"], next_token], dim=-1)
+        inputs["attention_mask"] = torch.cat(
+            [
+                inputs["attention_mask"],
+                torch.ones(
+                    (next_token.size(0), 1),
+                    dtype=torch.long,
+                    device=inputs["attention_mask"].device,
+                ),
+            ],
+            dim=-1,
+        )
 
-# 可以在这个函数里处理需要插入or删除request时对于kvcache，attention_mask的对齐修改等操作
-async def check_and_update_batch():
-    global request_queue, model_decode, decode_cnt
+        for index, item in enumerate(current_batch):
+            item["request"]["input_ids"] = inputs["input_ids"][index].unsqueeze(0)
+            item["request"]["attention_mask"] = inputs["attention_mask"][
+                index
+            ].unsqueeze(0)
 
-    for item in request_queue:
-        if item["new_flag"]:
-            item["new_flag"] = False
+        for item, seq in zip(current_batch, inputs["input_ids"]):
+            if not item["done_flag"]:
+                if seq.shape[0] - item["padding"] >= item["max"]:
+                    item["done_flag"] = True
+                elif (
+                    seq.shape[0] - item["padding"] >= item["min"]
+                    and seq[-1].item() == tokenizer.eos_token_id
+                ):
+                    item["done_flag"] = True
 
-            item["id"] = decode_cnt
-            print(f"decode: {decode_cnt}")
-            decode_cnt += 1
+        for item in current_batch:
+            item["kv_cache"] = []
 
-    for index, item in enumerate(request_queue):
-        if item["done_flag"]:
-            print(f"finish: {item["id"]}")
+        for layer_idx in range(32):
+            layer_key, layer_value = outputs.past_key_values[layer_idx]
 
-            decoded_output = tokenizer.decode(
-                item["request"]["input_ids"][0], skip_special_tokens=True
-            )
-            item["response"].set_result({"generated_text": decoded_output})
-            request_queue.pop(index)
+            for index, item in enumerate(current_batch):
+                key = layer_key[index].unsqueeze(0)
+                value = layer_value[index].unsqueeze(0)
+                item["kv_cache"].append((key, value))
+
+        for item in current_batch:
+            item["kv_cache"] = tuple(item["kv_cache"])
 
 
 async def decode_worker():
+    global check_time, generate_time
+
     while True:
         if not request_queue:
             await asyncio.sleep(0.1)
             continue
-        await check_and_update_batch()
-        await generate_one_step()
+
+        start_time = time.time()
+        bsz = await check_and_update_batch()
+        end_time = time.time()
+        check_time += end_time - start_time
+
+        if bsz == 0:
+            await asyncio.sleep(0.1)
+            continue
+
+        start_time = time.time()
+        await generate_one_step(bsz)
+        end_time = time.time()
+        generate_time += end_time - start_time
+
         await asyncio.sleep(0.00001)
 
 
